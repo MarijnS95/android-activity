@@ -3,7 +3,7 @@
 //! synchronization between the two threads.
 
 use std::{
-    ffi::{CStr, CString},
+    ffi::{c_void, CStr, CString},
     fs::File,
     io::{self, BufRead, BufReader},
     ops::Deref,
@@ -830,19 +830,17 @@ unsafe extern "C" fn on_content_rect_changed(
 #[no_mangle]
 extern "C" fn ANativeActivity_onCreate(
     activity: *mut ndk_sys::ANativeActivity,
-    saved_state: *const libc::c_void,
-    saved_state_size: libc::size_t,
+    saved_state: *const c_void,
+    saved_state_size: isize,
 ) {
     abort_on_panic(|| {
         // Maybe make this stdout/stderr redirection an optional / opt-in feature?...
         let file = unsafe {
-            let mut logpipe: [RawFd; 2] = Default::default();
-            libc::pipe2(logpipe.as_mut_ptr(), libc::O_CLOEXEC);
-            libc::dup2(logpipe[1], libc::STDOUT_FILENO);
-            libc::dup2(logpipe[1], libc::STDERR_FILENO);
-            libc::close(logpipe[1]);
+            let logpipe = rustix::pipe::pipe().unwrap();
+            rustix::stdio::dup2_stdout(logpipe.1).unwrap();
+            rustix::stdio::dup2_stderr(logpipe.1).unwrap();
 
-            File::from_raw_fd(logpipe[0])
+            File::from(logpipe.0)
         };
 
         std::thread::spawn(move || -> io::Result<()> {
@@ -873,7 +871,7 @@ extern "C" fn ANativeActivity_onCreate(
 
         let rust_glue = jvm_glue.clone();
         // Let us Send the NativeActivity pointer to the Rust main() thread without a wrapper type
-        let activity_ptr: libc::intptr_t = activity as _;
+        let activity_ptr: usize = activity as _;
 
         // Note: we drop the thread handle which will detach the thread
         std::thread::spawn(move || {

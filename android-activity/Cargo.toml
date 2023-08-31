@@ -39,7 +39,7 @@ ndk-context = "0.1"
 android-properties = "0.2"
 num_enum = "0.7"
 bitflags = "2.0"
-libc = "0.2"
+rustix = { version = "0.38", default-features = false, features = ["std", "pipe", "stdio"] }
 thiserror = "1"
 
 [build-dependencies]
