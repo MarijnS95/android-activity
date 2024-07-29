@@ -11,6 +11,7 @@ use std::time::Duration;
 use libc::c_void;
 use log::{error, trace};
 use ndk::input_queue::InputQueue;
+use ndk::native_activity::NativeActivity;
 use ndk::{asset::AssetManager, native_window::NativeWindow};
 
 use crate::error::InternalResult;
@@ -133,6 +134,7 @@ impl AndroidApp {
     }
 }
 
+// TODO: Why NIH?
 #[derive(Debug)]
 struct Looper {
     pub ptr: *mut ndk_sys::ALooper,
@@ -163,16 +165,16 @@ pub(crate) struct AndroidAppInner {
 
 impl AndroidAppInner {
     pub(crate) fn vm_as_ptr(&self) -> *mut c_void {
-        unsafe { (*self.native_activity.activity).vm as _ }
+        self.native_activity().vm().cast()
     }
 
     pub(crate) fn activity_as_ptr(&self) -> *mut c_void {
         // "clazz" is a completely bogus name; this is the _instance_ not class pointer
-        unsafe { (*self.native_activity.activity).clazz as _ }
+        self.native_activity().activity().cast()
     }
 
-    pub(crate) fn native_activity(&self) -> *const ndk_sys::ANativeActivity {
-        self.native_activity.activity
+    pub(crate) fn native_activity(&self) -> &NativeActivity {
+        &self.native_activity.activity
     }
 
     pub(crate) fn looper(&self) -> *mut ndk_sys::ALooper {
@@ -328,11 +330,8 @@ impl AndroidAppInner {
     }
 
     pub fn asset_manager(&self) -> AssetManager {
-        unsafe {
-            let activity_ptr = self.native_activity.activity;
-            let am_ptr = NonNull::new_unchecked((*activity_ptr).assetManager);
-            AssetManager::from_ptr(am_ptr)
-        }
+        // TODO: Report missing lifetime on NativeActivity upstream
+        self.native_activity.activity.asset_manager()
     }
 
     pub fn set_window_flags(
@@ -455,8 +454,7 @@ impl AndroidAppInner {
     }
 
     pub fn obb_path(&self) -> Option<std::path::PathBuf> {
-        let na = self.native_activity();
-        unsafe { util::try_get_path_from_ptr((*na).obbPath) }
+        Some(self.native_activity().obb_path().to_owned())
     }
 }
 

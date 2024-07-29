@@ -3,13 +3,20 @@
 //! synchronization between the two threads.
 
 use std::{
+    mem::ManuallyDrop,
     ops::Deref,
     panic::catch_unwind,
     ptr::{self, NonNull},
     sync::{Arc, Condvar, Mutex, Weak},
 };
 
-use ndk::{configuration::Configuration, input_queue::InputQueue, native_window::NativeWindow};
+use ndk::{
+    configuration::Configuration,
+    input_queue::{self, InputQueue},
+    looper::ForeignLooper,
+    native_activity::NativeActivity,
+    native_window::NativeWindow,
+};
 
 use crate::{
     jni_utils::CloneJavaVM,
@@ -75,7 +82,7 @@ pub enum State {
 
 #[derive(Debug)]
 pub struct WaitableNativeActivityState {
-    pub activity: *mut ndk_sys::ANativeActivity,
+    pub activity: NativeActivity,
 
     pub mutex: Mutex<NativeActivityState>,
     pub cond: Condvar,
@@ -85,8 +92,6 @@ pub struct WaitableNativeActivityState {
 pub struct NativeActivityGlue {
     pub inner: Arc<WaitableNativeActivityState>,
 }
-unsafe impl Send for NativeActivityGlue {}
-unsafe impl Sync for NativeActivityGlue {}
 
 impl Deref for NativeActivityGlue {
     type Target = WaitableNativeActivityState;
@@ -104,7 +109,8 @@ impl NativeActivityGlue {
     ) -> Self {
         let glue = Self {
             inner: Arc::new(WaitableNativeActivityState::new(
-                activity,
+                // TODO: receive NonNull
+                unsafe { NativeActivity::from_ptr(NonNull::new(activity).unwrap()) },
                 saved_state,
                 saved_state_size,
             )),
@@ -161,17 +167,14 @@ impl NativeActivityGlue {
     ) -> Option<InputQueue> {
         let mut guard = self.mutex.lock().unwrap();
 
-        if guard.input_queue.is_null() {
-            return None;
-        }
+        let input_queue = guard.input_queue.as_ref()?;
 
         unsafe {
             // Reattach the input queue to the looper so future input will again deliver an
             // `InputAvailable` event.
             guard.attach_input_queue_to_looper(looper, ident);
-            Some(InputQueue::from_ptr(NonNull::new_unchecked(
-                guard.input_queue,
-            )))
+            // TODO: We don't currently support cloning this wrapper, what's its lifetime?
+            Some(input_queue)
         }
     }
 
@@ -212,7 +215,7 @@ pub struct NativeActivityState {
     pub msg_write: libc::c_int,
     pub config: ConfigurationRef,
     pub saved_state: Vec<u8>,
-    pub input_queue: *mut ndk_sys::AInputQueue,
+    pub input_queue: Option<InputQueue>,
     pub window: Option<NativeWindow>,
     pub content_rect: ndk_sys::ARect,
     pub activity_state: State,
@@ -224,7 +227,7 @@ pub struct NativeActivityState {
     /// `onDestroyed` callback.
     pub destroyed: bool,
     pub redraw_needed: bool,
-    pub pending_input_queue: *mut ndk_sys::AInputQueue,
+    pub pending_input_queue: Option<InputQueue>,
     pub pending_window: Option<NativeWindow>,
 }
 
@@ -284,25 +287,22 @@ impl NativeActivityState {
 
     pub unsafe fn attach_input_queue_to_looper(
         &mut self,
+        // TODO: Pass ForeignLooper
         looper: *mut ndk_sys::ALooper,
         ident: libc::c_int,
     ) {
-        if !self.input_queue.is_null() {
+        if let Some(input_queue) = &self.input_queue {
             log::trace!("Attaching input queue to looper");
-            ndk_sys::AInputQueue_attachLooper(
-                self.input_queue,
-                looper,
-                ident,
-                None,
-                ptr::null_mut(),
-            );
+            // We don't own it
+            let looper = ManuallyDrop::new(ForeignLooper::from_ptr(NonNull::new(looper).unwrap()));
+            input_queue.attach_looper(&looper, ident)
         }
     }
 
     pub unsafe fn detach_input_queue_from_looper(&mut self) {
-        if !self.input_queue.is_null() {
+        if let Some(input_queue) = &self.input_queue {
             log::trace!("Detaching input queue from looper");
-            ndk_sys::AInputQueue_detachLooper(self.input_queue);
+            input_queue.detach_looper();
         }
     }
 }
@@ -323,7 +323,7 @@ impl WaitableNativeActivityState {
     ///////////////////////////////
 
     pub fn new(
-        activity: *mut ndk_sys::ANativeActivity,
+        activity: NativeActivity,
         saved_state_in: *const libc::c_void,
         saved_state_size: libc::size_t,
     ) -> Self {
@@ -344,16 +344,9 @@ impl WaitableNativeActivityState {
                 .to_vec()
         };
 
-        let config = unsafe {
-            let config = ndk_sys::AConfiguration_new();
-            ndk_sys::AConfiguration_fromAssetManager(config, (*activity).assetManager);
-
-            let config = super::ConfigurationRef::new(Configuration::from_ptr(
-                NonNull::new_unchecked(config),
-            ));
-            log::trace!("Config: {:#?}", config);
-            config
-        };
+        let config = Configuration::from_asset_manager(&activity.asset_manager());
+        let config = super::ConfigurationRef::new(config);
+        log::trace!("Config: {:#?}", config);
 
         Self {
             activity,
@@ -362,7 +355,7 @@ impl WaitableNativeActivityState {
                 msg_write: msgpipe[1],
                 config,
                 saved_state,
-                input_queue: ptr::null_mut(),
+                input_queue: None,
                 window: None,
                 content_rect: Rect::empty().into(),
                 activity_state: State::Init,
@@ -371,7 +364,7 @@ impl WaitableNativeActivityState {
                 app_has_saved_state: false,
                 destroyed: false,
                 redraw_needed: false,
-                pending_input_queue: ptr::null_mut(),
+                pending_input_queue: None,
                 pending_window: None,
             }),
             cond: Condvar::new(),
@@ -434,23 +427,23 @@ impl WaitableNativeActivityState {
         guard.write_cmd(AppCmd::WindowRedrawNeeded);
     }
 
-    unsafe fn set_input(&self, input_queue: *mut ndk_sys::AInputQueue) {
+    unsafe fn set_input(&self, input_queue: Option<InputQueue>) {
         let mut guard = self.mutex.lock().unwrap();
 
         // The pending_input_queue state should only be set while in this method, and since
         // it doesn't allow re-entrance and is cleared before returning then we expect
         // this to be null
         debug_assert!(
-            guard.pending_input_queue.is_null(),
+            guard.pending_input_queue.is_none(),
             "InputQueue update clash"
         );
 
         guard.pending_input_queue = input_queue;
         guard.write_cmd(AppCmd::InputQueueChanged);
-        while guard.input_queue != guard.pending_input_queue {
-            guard = self.cond.wait(guard).unwrap();
-        }
-        guard.pending_input_queue = ptr::null_mut();
+        // while guard.input_queue != guard.pending_input_queue {
+        self.cond
+            .wait_while(guard, |g| g.pending_input_queue.is_some())
+            .unwrap();
     }
 
     unsafe fn set_window(&self, window: Option<NativeWindow>) {
@@ -574,8 +567,8 @@ impl WaitableNativeActivityState {
             AppCmd::InputQueueChanged => {
                 let mut guard = self.mutex.lock().unwrap();
                 guard.detach_input_queue_from_looper();
-                guard.input_queue = guard.pending_input_queue;
-                if !guard.input_queue.is_null() {
+                guard.input_queue = guard.pending_input_queue.take();
+                if guard.input_queue.is_some() {
                     guard.attach_input_queue_to_looper(looper, input_queue_ident);
                 }
                 self.cond.notify_one();
@@ -598,9 +591,7 @@ impl WaitableNativeActivityState {
             }
             AppCmd::ConfigChanged => {
                 let guard = self.mutex.lock().unwrap();
-                let config = ndk_sys::AConfiguration_new();
-                ndk_sys::AConfiguration_fromAssetManager(config, (*self.activity).assetManager);
-                let config = Configuration::from_ptr(NonNull::new_unchecked(config));
+                let config = Configuration::from_asset_manager(&self.activity.asset_manager());
                 guard.config.replace(config);
                 log::debug!("Config: {:#?}", guard.config);
             }
@@ -634,6 +625,9 @@ extern "Rust" {
     pub fn android_main(app: AndroidApp);
 }
 
+/// Gracefully handles spurious JVM callbacks when the activity could already have been shut down,
+/// where our [`Weak`] reference inside [`ndk_sys::ANativeActivity::instance`] no longer contains
+/// any state.
 unsafe fn try_with_waitable_activity_ref(
     activity: *mut ndk_sys::ANativeActivity,
     closure: impl FnOnce(Arc<WaitableNativeActivityState>),
@@ -797,7 +791,8 @@ unsafe extern "C" fn on_input_queue_created(
     abort_on_panic(|| {
         log::debug!("InputQueueCreated: {:p} -- {:p}\n", activity, queue);
         try_with_waitable_activity_ref(activity, |waitable_activity| {
-            waitable_activity.set_input(queue);
+            let queue = NonNull::new(queue).unwrap();
+            waitable_activity.set_input(Some(InputQueue::from_ptr(queue)));
         });
     })
 }
@@ -809,7 +804,7 @@ unsafe extern "C" fn on_input_queue_destroyed(
     abort_on_panic(|| {
         log::debug!("InputQueueDestroyed: {:p} -- {:p}\n", activity, queue);
         try_with_waitable_activity_ref(activity, |waitable_activity| {
-            waitable_activity.set_input(ptr::null_mut());
+            waitable_activity.set_input(None);
         });
     })
 }
